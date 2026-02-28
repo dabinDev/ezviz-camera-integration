@@ -3,6 +3,7 @@ from ezviz_device import get_device_list, get_live_url, disable_device_encrypt
 from ezviz_player import EzvizPlayer
 import time
 import os
+from pathlib import Path
 
 def _get_best_live_url(token: str, device_serial: str, channel_no: int) -> str:
     for protocol in (2, 1, 3, None):
@@ -14,7 +15,25 @@ def _get_best_live_url(token: str, device_serial: str, channel_no: int) -> str:
             return url
     return get_live_url(token, device_serial, channel_no)
 
+def _load_dotenv() -> None:
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        pass
+
 def main():
+    _load_dotenv()
     # 1. 配置你的 AppKey/AppSecret（建议从环境变量或配置文件读）
     APP_KEY = os.getenv("EZVIZ_APP_KEY")
     APP_SECRET = os.getenv("EZVIZ_APP_SECRET")

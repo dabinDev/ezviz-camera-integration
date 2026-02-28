@@ -8,6 +8,9 @@ from urllib.parse import urljoin
 import threading
 import requests
 import json
+import io
+from pathlib import Path
+from PIL import Image, ImageTk
 
 
 def _configure_vlc_on_windows() -> None:
@@ -41,6 +44,25 @@ def _configure_vlc_on_windows() -> None:
 
 
 _configure_vlc_on_windows()
+
+def _load_dotenv() -> None:
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        pass
+
+_load_dotenv()
 
 try:
     import vlc
@@ -97,6 +119,8 @@ class EzvizDesktopApp:
         self._current_url = None
         self._current_expire_ts = None
         self._refresh_job = None
+        self._last_capture_dir = None
+        self._capture_preview_img = None
 
         if vlc is None:
             messagebox.showerror(
@@ -274,6 +298,11 @@ class EzvizDesktopApp:
         self.btn_capture.pack(fill=tk.X, padx=8, pady=8)
 
         self.ctrl_log = tk.Text(self.ctrl_right, height=10)
+        self.ctrl_preview_box = tk.LabelFrame(self.ctrl_right, text="抓拍预览")
+        self.ctrl_preview_box.pack(fill=tk.X, padx=10, pady=(10, 0))
+        self.ctrl_preview_label = tk.Label(self.ctrl_preview_box, text="暂无")
+        self.ctrl_preview_label.pack(fill=tk.BOTH, padx=8, pady=8)
+
         self.ctrl_log.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         # Record tab
@@ -615,13 +644,18 @@ class EzvizDesktopApp:
         serial = d.get("deviceSerial")
         channel_no = self._get_channel_no(d)
 
-        out_path = filedialog.asksaveasfilename(
-            title="保存抓拍图片",
-            defaultextension=".jpg",
-            filetypes=[("JPEG", "*.jpg"), ("PNG", "*.png"), ("All Files", "*.*")],
-        )
-        if not out_path:
-            return
+        if self._last_capture_dir:
+            ts_name = time.strftime("capture_%Y%m%d_%H%M%S.jpg")
+            out_path = os.path.join(self._last_capture_dir, ts_name)
+        else:
+            out_path = filedialog.asksaveasfilename(
+                title="保存抓拍图片",
+                defaultextension=".jpg",
+                filetypes=[("JPEG", "*.jpg"), ("PNG", "*.png"), ("All Files", "*.*")],
+            )
+            if not out_path:
+                return
+            self._last_capture_dir = os.path.dirname(out_path)
 
         def work():
             pic_url = capture_picture(self.token, serial, channel_no)
@@ -629,14 +663,49 @@ class EzvizDesktopApp:
             r.raise_for_status()
             with open(out_path, "wb") as f:
                 f.write(r.content)
-            return pic_url
+            return pic_url, out_path
 
         self._run_bg(
             work,
             ok_text="抓拍已保存",
             err_prefix="抓拍失败",
-            on_ok=lambda pic_url: self._log_ctrl(f"抓拍URL: {pic_url}"),
+            on_ok=lambda res: self._on_capture_ok(res),
         )
+
+    def _on_capture_ok(self, res):
+        try:
+            pic_url, out_path = res
+        except Exception:
+            pic_url, out_path = None, None
+        if pic_url:
+            self._log_ctrl(f"抓拍URL: {pic_url}")
+        if pic_url:
+            self._show_capture_preview_url(pic_url, fallback_path=out_path)
+        elif out_path:
+            self._show_capture_preview(out_path)
+
+    def _show_capture_preview(self, img_path: str):
+        try:
+            img = Image.open(img_path)
+            img.thumbnail((360, 240))
+            self._capture_preview_img = ImageTk.PhotoImage(img)
+            self.ctrl_preview_label.configure(image=self._capture_preview_img, text="")
+        except Exception as e:
+            self.ctrl_preview_label.configure(text=f"预览失败: {e}", image="")
+
+    def _show_capture_preview_url(self, img_url: str, fallback_path: str | None = None):
+        try:
+            r = requests.get(img_url, timeout=20)
+            r.raise_for_status()
+            img = Image.open(io.BytesIO(r.content))
+            img.thumbnail((360, 240))
+            self._capture_preview_img = ImageTk.PhotoImage(img)
+            self.ctrl_preview_label.configure(image=self._capture_preview_img, text="")
+        except Exception as e:
+            if fallback_path:
+                self._show_capture_preview(fallback_path)
+            else:
+                self.ctrl_preview_label.configure(text=f"预览失败: {e}", image="")
 
     def _get_selected_device_for_records(self) -> dict | None:
         val = self.record_device_var.get()
@@ -701,7 +770,7 @@ class EzvizDesktopApp:
 
     def _extract_playable_url_from_record_item(self, item: dict) -> str | None:
         # Try common fields.
-        for k in ("url", "playUrl", "playURL", "hls", "hlsHd", "downloadUrl", "downloadURL"):
+        for k in ("url", "playUrl", "playURL", "hls", "hlsHd", "downloadUrl", "downloadURL", "downloadPath"):
             v = item.get(k)
             if isinstance(v, str) and v.startswith(("http://", "https://", "rtmp://")):
                 return v
@@ -742,14 +811,14 @@ class EzvizDesktopApp:
             messagebox.showinfo("提示", "请先选择一条录像")
             return
         url = self._extract_playable_url_from_record_item(item)
-        if not url or not url.endswith(".m3u8"):
-            messagebox.showwarning("暂不支持", "当前仅支持下载 m3u8(HLS) 回放地址。")
+        if not url:
+            messagebox.showwarning("暂不支持", "当前录像条目没有可用下载地址。")
             return
 
         out_path = filedialog.asksaveasfilename(
             title="保存为",
-            defaultextension=".ts",
-            filetypes=[("MPEG-TS", "*.ts"), ("All Files", "*.*")],
+            defaultextension=".ts" if url.endswith(".m3u8") else ".mp4",
+            filetypes=[("MPEG-TS", "*.ts"), ("MP4", "*.mp4"), ("All Files", "*.*")],
         )
         if not out_path:
             return
@@ -757,7 +826,10 @@ class EzvizDesktopApp:
         def worker():
             try:
                 self.root.after(0, lambda: self.set_status("下载中..."))
-                self._download_hls_to_ts(url, out_path)
+                if url.endswith(".m3u8"):
+                    self._download_hls_to_ts(url, out_path)
+                else:
+                    self._download_file(url, out_path)
                 self.root.after(0, lambda: self.set_status("下载完成"))
                 self.root.after(0, lambda: messagebox.showinfo("完成", f"已保存: {out_path}"))
             except Exception as e:
@@ -765,6 +837,14 @@ class EzvizDesktopApp:
                 self.root.after(0, lambda: messagebox.showerror("下载失败", str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _download_file(self, url: str, out_path: str) -> None:
+        with requests.get(url, stream=True, timeout=30) as resp:
+            resp.raise_for_status()
+            with open(out_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        f.write(chunk)
 
     def _download_hls_to_ts(self, m3u8_url: str, out_path: str) -> None:
         r = requests.get(m3u8_url, timeout=30)
