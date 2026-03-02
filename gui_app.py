@@ -72,23 +72,25 @@ except Exception as e:
 
 from ezviz_auth import get_access_token
 from ezviz_device import (
-    disable_device_encrypt,
-    enable_device_encrypt,
     get_device_list,
-    get_device_info,
-    get_device_capacity,
-    get_device_camera_list,
-    get_device_status,
-    get_sound_switch_status,
-    set_sound_switch,
-    get_scene_switch_status,
-    set_scene_switch,
     get_live_url,
-    list_record_files_by_time,
     ptz_start,
     ptz_stop,
     capture_picture,
     set_device_defence,
+    enable_device_encrypt,
+    disable_device_encrypt,
+    list_record_files_by_time,
+    get_device_info,
+    get_device_capacity,
+    get_device_camera_list,
+    get_sound_switch_status,
+    set_sound_switch,
+    get_scene_switch_status,
+    set_scene_switch,
+    get_device_status,
+    download_video_file,
+    get_cloud_record_files,
 )
 
 
@@ -738,11 +740,26 @@ class EzvizDesktopApp:
                 return
 
             self.set_status("查询录像中...")
+            files = []
+            
+            # 首先尝试查询云存储录像（包含文件ID）
             try:
-                rec_type = self._rectype_map.get(self.record_rectype_var.get(), 0)
-            except Exception:
-                rec_type = 0
-            files = list_record_files_by_time(self.token, device_serial, channel_no, start_dt, end_dt, rec_type=rec_type)
+                cloud_files = get_cloud_record_files(self.token, device_serial, channel_no, start_dt, end_dt)
+                files.extend(cloud_files)
+                self._log_ctrl(f"云存储录像: {len(cloud_files)}条")
+            except Exception as e:
+                self._log_ctrl(f"云存储录像查询失败: {e}")
+            
+            # 如果云存储没有数据，查询本地设备录像
+            if not files:
+                try:
+                    rec_type = self._rectype_map.get(self.record_rectype_var.get(), 0)
+                    local_files = list_record_files_by_time(self.token, device_serial, channel_no, start_dt, end_dt, rec_type=rec_type)
+                    files.extend(local_files)
+                    self._log_ctrl(f"本地设备录像: {len(local_files)}条")
+                except Exception as e:
+                    self._log_ctrl(f"本地录像查询失败: {e}")
+            
             self._record_items = files
             self.record_list.delete(0, tk.END)
             for it in files:
@@ -751,8 +768,19 @@ class EzvizDesktopApp:
                 bt = self._format_ms_ts(bt_raw)
                 et = self._format_ms_ts(et_raw)
                 rec_type = it.get("recType") if "recType" in it else it.get("type")
-                self.record_list.insert(tk.END, f"{bt} ~ {et}  recType={rec_type}")
+                file_id = self._extract_file_id_from_record_item(it)
+                
+                # 在列表中显示是否有文件ID
+                display_text = f"{bt} ~ {et}  recType={rec_type}"
+                if file_id:
+                    display_text += " [云存储]"
+                else:
+                    display_text += " [本地]"
+                    
+                self.record_list.insert(tk.END, display_text)
+            
             self.set_status(f"录像数量: {len(files)}")
+            self._log_ctrl(f"查询完成，共{len(files)}条录像")
         except Exception as e:
             messagebox.showerror("错误", str(e))
             self.set_status("错误")
@@ -774,6 +802,14 @@ class EzvizDesktopApp:
             v = item.get(k)
             if isinstance(v, str) and v.startswith(("http://", "https://", "rtmp://")):
                 return v
+        return None
+
+    def _extract_file_id_from_record_item(self, item: dict) -> str | None:
+        """提取录像文件ID"""
+        for k in ("fileId", "file_id", "id", "videoId", "video_id"):
+            v = item.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
         return None
 
     def play_selected_record(self):
@@ -810,15 +846,60 @@ class EzvizDesktopApp:
         if not item:
             messagebox.showinfo("提示", "请先选择一条录像")
             return
-        url = self._extract_playable_url_from_record_item(item)
-        if not url:
-            messagebox.showwarning("暂不支持", "当前录像条目没有可用下载地址。")
+
+        # 优先尝试使用文件ID下载
+        file_id = self._extract_file_id_from_record_item(item)
+        download_url = None
+        
+        if file_id:
+            try:
+                self.set_status("获取下载地址...")
+                download_url = download_video_file(self.token, file_id)
+                self._log_ctrl(f"通过文件ID获取下载地址成功: {file_id}")
+            except Exception as e:
+                self._log_ctrl(f"文件ID下载失败，尝试直接URL下载: {e}")
+        
+        # 如果文件ID下载失败，尝试直接使用URL
+        if not download_url:
+            download_url = self._extract_playable_url_from_record_item(item)
+        
+        if not download_url:
+            # 显示详细的录像信息供调试
+            item_json = json.dumps(item, ensure_ascii=False, indent=2)
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(item_json)
+            except Exception:
+                pass
+            messagebox.showwarning(
+                "暂不支持下载",
+                "当前录像条目没有可用的下载地址。\n"
+                "可能原因：\n"
+                "1. 未开通云存储/云录制服务\n"
+                "2. 录像文件已过期\n"
+                "3. 设备不支持云端下载\n\n"
+                "录像信息已复制到剪贴板，可查看详细字段。\n\n"
+                f"文件ID: {file_id or '无'}\n"
+                f"可用URL字段: {list(item.keys())}"
+            )
             return
 
+        # 生成默认文件名
+        start_time = item.get("startTime") or item.get("beginTime") or item.get("begin")
+        if start_time:
+            try:
+                start_dt = datetime.fromtimestamp(int(start_time) / 1000)
+                default_name = f"录像_{start_dt.strftime('%Y%m%d_%H%M%S')}.mp4"
+            except Exception:
+                default_name = "录像文件.mp4"
+        else:
+            default_name = "录像文件.mp4"
+
         out_path = filedialog.asksaveasfilename(
-            title="保存为",
-            defaultextension=".ts" if url.endswith(".m3u8") else ".mp4",
-            filetypes=[("MPEG-TS", "*.ts"), ("MP4", "*.mp4"), ("All Files", "*.*")],
+            title="保存录像文件",
+            initialvalue=default_name,
+            defaultextension=".mp4",
+            filetypes=[("MP4文件", "*.mp4"), ("MPEG-TS", "*.ts"), ("所有文件", "*.*")],
         )
         if not out_path:
             return
@@ -826,15 +907,20 @@ class EzvizDesktopApp:
         def worker():
             try:
                 self.root.after(0, lambda: self.set_status("下载中..."))
-                if url.endswith(".m3u8"):
-                    self._download_hls_to_ts(url, out_path)
+                self._log_ctrl(f"开始下载: {download_url}")
+                
+                if download_url.endswith(".m3u8"):
+                    self._download_hls_to_ts(download_url, out_path)
                 else:
-                    self._download_file(url, out_path)
+                    self._download_file(download_url, out_path)
+                
                 self.root.after(0, lambda: self.set_status("下载完成"))
-                self.root.after(0, lambda: messagebox.showinfo("完成", f"已保存: {out_path}"))
+                self.root.after(0, lambda: messagebox.showinfo("下载完成", f"文件已保存至:\n{out_path}"))
+                self._log_ctrl(f"下载完成: {out_path}")
             except Exception as e:
                 self.root.after(0, lambda: self.set_status("下载失败"))
                 self.root.after(0, lambda: messagebox.showerror("下载失败", str(e)))
+                self._log_ctrl(f"下载失败: {e}")
 
         threading.Thread(target=worker, daemon=True).start()
 

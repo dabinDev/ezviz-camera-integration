@@ -287,3 +287,48 @@ def build_ezopen_playback_url(device_serial: str, channel_no: int, begin_time: d
     if validate_code:
         prefix = f"ezopen://{validate_code}@open.ys7.com"
     return f"{prefix}/{device_serial}/{channel_no}.local.rec?begin={begin}&end={end}"
+
+def download_video_file(access_token: str, file_id: str) -> str:
+    """
+    通过文件ID下载视频文件
+    返回下载URL
+    """
+    url = "https://open.ys7.com/api/lapp/video/download/get"
+    data = {
+        "accessToken": access_token,
+        "fileId": file_id
+    }
+    resp = requests.post(url, data=data, timeout=30)
+    result = resp.json()
+    if result.get("code") != "200":
+        raise Exception(f"获取下载地址失败[{result.get('code')}]: {result.get('msg')}")
+    data_obj = result.get("data")
+    if isinstance(data_obj, dict) and isinstance(data_obj.get("downloadUrl"), str):
+        return data_obj["downloadUrl"]
+    raise Exception(f"下载地址格式异常: {data_obj}")
+
+def get_cloud_record_files(access_token: str, device_serial: str, channel_no: int, 
+                          start_time: datetime, end_time: datetime) -> list:
+    """
+    获取云存储录像文件列表（包含文件ID）
+    """
+    url = "https://open.ys7.com/api/lapp/cloud/video/file/list"
+    start_ms = int(start_time.timestamp() * 1000)
+    end_ms = int(end_time.timestamp() * 1000)
+    data = {
+        "accessToken": access_token,
+        "deviceSerial": device_serial,
+        "channelNo": channel_no,
+        "startTime": start_ms,
+        "endTime": end_ms
+    }
+    resp = requests.post(url, data=data, timeout=25)
+    result = resp.json()
+    if result.get("code") != "200":
+        raise Exception(f"获取云录像文件失败[{result.get('code')}]: {result.get('msg')}")
+    data_obj = result.get("data")
+    if isinstance(data_obj, list):
+        return data_obj
+    if isinstance(data_obj, dict) and isinstance(data_obj.get("data"), list):
+        return data_obj.get("data")
+    return []
